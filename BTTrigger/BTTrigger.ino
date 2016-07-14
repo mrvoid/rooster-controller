@@ -1,12 +1,19 @@
 #include <SoftwareSerial.h>
 #include "pwm.hpp"
 
-const int DRIVE_FORWARD_PIN = 9;
-const int ACTIVE_PIN = 10;
+const char* VERSION = "1.0-dev";
 
-SoftwareSerial mySerial(14, 15); // RX, TX
+const int PIN_BLUETOOTH_RX = 14;
+const int PIN_BLUETOOTH_TX = 15;
 
-PWMDriver pwm;
+const int PIN_DRIVE_LED = 8;
+const int PIN_DRIVE_MOTOR = 9;
+const int PIN_INDICATOR_LED = 10;
+
+SoftwareSerial mySerial(PIN_BLUETOOTH_RX, PIN_BLUETOOTH_TX);
+
+PWMDriver pwm_motor(PIN_DRIVE_MOTOR, 0, 30);
+PWMDriver pwm_light(PIN_DRIVE_LED);
 
 String inputString = "";         // a string to hold incoming data
 boolean stringComplete = false;  // whether the string is complete
@@ -19,6 +26,9 @@ enum Mode {
 struct State {
   int mode = Mode::REMOTE;
   int move = 0;
+  int light = 0;
+
+  bool blink_on = false;
 } state; 
 
 struct Settings {
@@ -26,9 +36,13 @@ struct Settings {
   int drive_deadPower = 95;
 
   // Communication
-  int comm_stateSendDelay = 1000;
+  int  comm_stateSendDelay = 1000;
   bool comm_idleSendState = false;
-  int comm_shutdownDelay = 500;
+  int  comm_shutdownDelay = 500;
+
+  // Blinker
+  int blink_duty = 10;
+  int blink_rate = 2000;
   
   // Autopilot settings
   int auto_turnMax = 100;
@@ -39,41 +53,39 @@ int sign(int v) {
   return v == 0 ? 0 : (v < 0 ? -1 : 1);
 }
 
-void setup() {
-  // initialize serial:
-  // 15/14 + 9
-  Serial.begin(9600);
-  mySerial.begin(9600);
-  
-  // reserve 200 bytes for the inputString:
-  inputString.reserve(200);
-  
-  // Connect to the Motor 
-  pinMode(DRIVE_FORWARD_PIN, OUTPUT);
-  pinMode(ACTIVE_PIN, OUTPUT);
-  
-  // Timing
-  lastCommand = millis();
+
+void blink() {
+  bool last_state = state.blink_on;
+  if (settings.blink_rate == 0) {
+    state.blink_on == true;
+  } else {
+    long cycle = millis() % settings.blink_rate;
+    long phase = 100 * cycle / settings.blink_rate;
+    
+    state.blink_on = settings.blink_duty < phase;
+  }
+
+  // Only change when state changes and save 2 microseconds
+  if (last_state ^ state.blink_on)
+    digitalWrite(PIN_INDICATOR_LED, state.blink_on ? HIGH : LOW);
 }
 
-void _drive(int f) {
-  pwm.set(DRIVE_FORWARD_PIN, f);
-}
-
-void move(int val, int ms) {
-  int v = abs(val);
-  if (v < 1)
-    v = 0;
-  else 
-    v = map(v, 1, 255, settings.drive_deadPower, 255);
-
-  _drive(v);
-  
-  delay(ms);
-}
-
+/**
+ * Shutdown all activity
+ */
 void stop() {
-  move(0, 0);
+  pwm_motor.set(0);
+  pwm_light.set(0);
+}
+
+/** 
+ *  Apply the current state to the hardware.
+ */
+void execute() {
+  pwm_motor.setDeadZone(settings.drive_deadPower);
+  pwm_motor.set(state.move);
+
+  pwm_light.set(state.light);
 }
 
 void sendState() {
@@ -82,21 +94,56 @@ void sendState() {
   Serial.println();
 }
 
-/** 
- *  Apply the current state to the hardware.
- */
-void execute() {
-  move(state.move, 0);
+void listAllParameters() {
+  Serial.print("MAX_TIME_TO_IDLE ");
+  Serial.println(-1);
+  
+  Serial.print("MAX_MESSAGE_LENGTH ");
+  Serial.println(199);
+  
+  Serial.print("IDLE_BLINK_RATE ");
+  Serial.println(settings.blink_rate);
+  
+  Serial.print("IDLE_DUTY_CYCLE ");
+  Serial.println(settings.blink_duty);
+  
+  Serial.print("BT_BAUD_RATE ");
+  Serial.println(9600);
+  
+  Serial.print("BT_PIN ");
+  Serial.print(PIN_BLUETOOTH_RX);
+  Serial.print(" ");
+  Serial.println(PIN_BLUETOOTH_RX);
 }
 
 long lastStateUpdate = 0;
 void processCommand(String command, String args) {
   if (command.compareTo("M") == 0) {
     int value = args.toInt();
-    int out = constrain(map(value, -100, 100, -255, 255), -255, 255);
+    int out = map(value, 0, 100, 0, 255);
     state.move = out;
   }
 
+  if (command.compareTo("L") == 0) {
+    int value = args.toInt();
+    int out = map(value, 0, 100, 0, 255);
+    state.light = out;
+  }
+
+  if (command.compareTo("S") == 0) {
+    // TODO: Change parameters
+    listAllParameters();
+  }
+
+  if (command.compareTo("R") == 0) {
+    // TODO: Factory reset
+  }
+
+  if (command.compareTo("V") == 0) {
+    Serial.print("Version: ");
+    Serial.println(VERSION);
+  }
+  
   // Send back the state.
   if (lastStateUpdate + settings.comm_stateSendDelay < millis()) {
     sendState();
@@ -104,15 +151,21 @@ void processCommand(String command, String args) {
   }
 }
 
+/* 
+ *  Process a line to a command. 
+ *  Input parameter is mutated in this function. Beware.
+ */
 void processLine(String s) {
   if (s.length() <= 1)
     return;
+
+  s.trim();
   
   int toCommand = s.indexOf(' ');
   if (toCommand == -1) {
-      String command = s.substring(0, s.length()-1);
-      Serial.println("Command: " + command + " no args.");  
-      processCommand(command, "");  
+    String command = s.substring(0, s.length()-1);
+    Serial.println("Command: " + command + " no args.");  
+    processCommand(command, "");  
   }
   else {
     String command = s.substring(0, toCommand);
@@ -142,17 +195,42 @@ void serialEventX() {
   }
 }
 
-bool blink_state = false;
-long blink_last = 0;
-void blink() {
-  if (!blink_state && millis() - blink_last < 1000)
-    return;
-  if (blink_state && millis() - blink_last < 100)
-    return;
+/*
+  SerialEvent occurs whenever a new data comes in the
+ hardware serial RX.  This routine is run between each
+ time loop() runs, so using delay inside loop can delay
+ response.  Multiple bytes of data may be available.
+ */
+void serialEvent() {
+  while (Serial.available()) {
+    // get the new byte:
+    char inChar = (char)Serial.read();
+    // add it to the inputString:
+    inputString += inChar;
+    // if the incoming character is a newline, set a flag
+    // so the main loop can do something about it:
+    if (inChar == '\n') {
+      stringComplete = true;
+    }
+  }
+}
 
-  blink_last = millis();
-  blink_state = !blink_state;
-  digitalWrite(ACTIVE_PIN, blink_state ? HIGH : LOW);
+void setup() {
+  // initialize serial:
+  // 15/14 + 9
+  Serial.begin(9600);
+  mySerial.begin(9600);
+  
+  // reserve 200 bytes for the inputString:
+  inputString.reserve(200);
+  
+  // Connect to the Motor 
+  pinMode(PIN_DRIVE_MOTOR, OUTPUT);
+  pinMode(PIN_DRIVE_LED, OUTPUT);
+  pinMode(PIN_INDICATOR_LED, OUTPUT);
+  
+  // Timing
+  lastCommand = millis();
 }
 
 void loop() {
@@ -176,28 +254,5 @@ void loop() {
     // clear the string:
     inputString = "";
     stringComplete = false;
-  }
-}
-
-
-
-
-/*
-  SerialEvent occurs whenever a new data comes in the
- hardware serial RX.  This routine is run between each
- time loop() runs, so using delay inside loop can delay
- response.  Multiple bytes of data may be available.
- */
-void serialEvent() {
-  while (Serial.available()) {
-    // get the new byte:
-    char inChar = (char)Serial.read();
-    // add it to the inputString:
-    inputString += inChar;
-    // if the incoming character is a newline, set a flag
-    // so the main loop can do something about it:
-    if (inChar == '\n') {
-      stringComplete = true;
-    }
   }
 }
